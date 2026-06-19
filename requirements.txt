@@ -1,0 +1,6 @@
+mcp>=1.0.0
+pytrends>=1.5.9
+pydantic>=2.0.0
+httpx>=0.24.0
+python-dateutil>=2.8.2
+pandas>=2.0.0
