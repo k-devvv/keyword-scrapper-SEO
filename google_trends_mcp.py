@@ -23,12 +23,29 @@ Tool -> trendspyg function map:
        related_queries, and interest_by_region together)
 """
 
+import sys
+import logging
+
+# ============================================================================
+# CRITICAL: Wire logging to stderr BEFORE any other imports.
+# MCP stdio transport owns stdout as the JSON-RPC channel.
+# Any stray write to stdout corrupts the protocol and causes:
+#   "Invalid JSON: EOF while parsing a value"
+# We do NOT touch sys.stdout at all — just make sure our own
+# logging always goes to stderr.
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 import json
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-import logging
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, field_validator, ConfigDict
@@ -38,15 +55,21 @@ from trendspyg import download_google_trends_rss, download_google_trends_explore
 # SETUP
 # ============================================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 mcp = FastMCP("google_trends_mcp")
 
 DB_PATH = Path.home() / ".google_trends_cache.db"
-CACHE_TTL_TRENDING = 15 * 60  # 15 minutes
-CACHE_TTL_HISTORY = 60 * 60  # 1 hour
-CACHE_TTL_RELATED = 6 * 60 * 60  # 6 hours
+CACHE_TTL_TRENDING = 15 * 60   # 15 minutes
+CACHE_TTL_HISTORY  = 60 * 60   # 1 hour
+CACHE_TTL_RELATED  = 6 * 60 * 60  # 6 hours
+
+VALID_REGIONS = [
+    "", "US", "UK", "GB", "IN", "BR", "DE", "FR", "CA", "AU", "JP",
+    "CN", "ZA", "MX", "AR", "CL", "CO", "PE", "VE", "ES", "IT",
+    "PT", "NL", "BE", "CH", "AT", "SE", "NO", "DK", "FI", "PL",
+    "CZ", "HU", "RO", "TR", "RU", "UA", "SA", "AE", "EG", "NG",
+    "KE", "GH", "TZ", "ET", "KR", "TH", "PH", "ID", "MY", "SG",
+    "VN", "PK", "BD", "NZ", "IL", "IR", "IQ",
+]
 
 CATEGORY_MAP = {
     "all": 0,
@@ -55,7 +78,7 @@ CATEGORY_MAP = {
     "business": 12,
     "cars": 47,
     "cooking": 71,
-    "crypto": 7_139,
+    "crypto": 7139,
     "fitness": 71,
     "games": 8,
     "health": 45,
@@ -80,10 +103,8 @@ CATEGORY_MAP = {
 # ============================================================================
 
 def _init_db():
-    """Initialize SQLite cache tables."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS trending_keywords_cache (
             id INTEGER PRIMARY KEY,
@@ -96,7 +117,6 @@ def _init_db():
             UNIQUE(region, category, keyword)
         )
     """)
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS interest_history_cache (
             id INTEGER PRIMARY KEY,
@@ -109,7 +129,6 @@ def _init_db():
             UNIQUE(keyword, region, timeframe)
         )
     """)
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS related_keywords_cache (
             id INTEGER PRIMARY KEY,
@@ -121,13 +140,11 @@ def _init_db():
             UNIQUE(keyword, region)
         )
     """)
-
     conn.commit()
     conn.close()
 
 
 def _get_cached(table: str, key_conditions: str) -> Optional[str]:
-    """Retrieve cached data if not expired."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -143,7 +160,6 @@ def _get_cached(table: str, key_conditions: str) -> Optional[str]:
 
 
 def _set_cached(table: str, key_cols: str, key_vals: tuple, data: str, ttl_seconds: int):
-    """Store data in cache with expiration."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -166,11 +182,6 @@ def _set_cached(table: str, key_cols: str, key_vals: tuple, data: str, ttl_secon
 # ============================================================================
 
 async def fetch_trending_rss(geo: str = "US") -> List[Dict[str, Any]]:
-    """
-    Fetch currently-booming search keywords for a geo via Google Trends RSS.
-    Returns Google's own rank order, real volume_min, freshness (started_at),
-    and related queries/news for content angles.
-    """
     try:
         env = download_google_trends_rss(geo=geo, normalize=True)
         return env.get("trends", [])
@@ -178,14 +189,9 @@ async def fetch_trending_rss(geo: str = "US") -> List[Dict[str, Any]]:
         raise ValueError(f"Failed to fetch trending searches via RSS: {str(e)}")
 
 
-async def fetch_explore(keyword: str, geo: str = "US", timeframe: str = "today 1-m") -> Dict[str, Any]:
-    """
-    Fetch the full Explore envelope for a keyword: interest_over_time,
-    related_queries, and interest_by_region in one browser-rendered call.
-    This is slower than a raw HTTP call but renders Google's actual page,
-    so it isn't subject to the reverse-engineered-endpoint breakage that
-    hits pytrends.
-    """
+async def fetch_explore(
+    keyword: str, geo: str = "US", timeframe: str = "now 7-d"
+) -> Dict[str, Any]:
     try:
         return download_google_trends_explore(
             keyword=keyword,
@@ -203,84 +209,77 @@ async def fetch_explore(keyword: str, geo: str = "US", timeframe: str = "today 1
 # ============================================================================
 
 class DetectTrendingKeywordsInput(BaseModel):
-    """Input for detect_trending_keywords tool."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
 
     region: str = Field(
         default="US",
-        description="Region code (US, UK, IN, BR, DE, FR, etc.)",
-        min_length=2,
-        max_length=5,
+        description=(
+            "Region code. Examples: US, IN, GB, BR, DE, FR, CA, AU, JP, ZA, "
+            "MX, SG, NG, KE, PH, ID, TR, SA, AE, KR, TH, PL, IT, ES. "
+            "Pass empty string '' for worldwide."
+        ),
     )
-    limit: int = Field(default=10, description="Number of keywords to return", ge=1, le=20)
+    limit: int = Field(default=20, description="Number of keywords to return", ge=1, le=30)
     min_volume: Optional[int] = Field(
         default=None,
-        description="Minimum search volume (volume_min) to include. If None, no filtering.",
+        description="Minimum search volume (volume_min) to include. None = no filter.",
         ge=0,
     )
 
     @field_validator("region")
     @classmethod
     def validate_region(cls, v: str) -> str:
-        valid = ["US", "UK", "IN", "BR", "DE", "FR", "CA", "AU", "JP", "CN", "ZA", ""]
-        if v not in valid:
-            raise ValueError(f"Region must be one of: {valid}")
+        v = v.upper().strip()
+        if v not in VALID_REGIONS:
+            logger.warning(f"Region '{v}' not in known list — passing through anyway.")
         return v
 
 
 class GetKeywordInterestHistoryInput(BaseModel):
-    """Input for get_keyword_interest_history tool."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
 
     keyword: str = Field(..., description="Keyword to analyze", min_length=1, max_length=100)
     timeframe: str = Field(
-        default="today 1-m",
-        description="Time range: 'today 1-m', 'today 3-m', 'today 12-m', 'today 5-y'",
+        default="now 7-d",
+        description=(
+            "Time range. Most current options: "
+            "'now 1-H' (past hour), 'now 4-H' (4 hours), 'now 1-d' (24h), "
+            "'now 7-d' (7 days — default), 'today 1-m', 'today 3-m', "
+            "'today 12-m', 'today 5-y'."
+        ),
     )
-    region: str = Field(default="US", description="Region code (US, UK, IN, etc.)")
+    region: str = Field(default="US", description="Region code (US, IN, GB, etc.)")
     include_geo_breakdown: bool = Field(
         default=False, description="Include interest by region breakdown"
     )
 
-    @field_validator("timeframe")
-    @classmethod
-    def validate_timeframe(cls, v: str) -> str:
-        valid = ["today 1-m", "today 3-m", "today 12-m", "today 5-y"]
-        if v not in valid:
-            raise ValueError(f"Timeframe must be one of: {valid}")
-        return v
-
 
 class GetRelatedKeywordsInput(BaseModel):
-    """Input for get_related_keywords tool."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
 
     keyword: str = Field(..., description="Main keyword to analyze", min_length=1, max_length=100)
-    region: str = Field(default="US", description="Region code (US, UK, IN, etc.)")
+    region: str = Field(default="US", description="Region code (US, IN, GB, etc.)")
     include_queries: bool = Field(default=True, description="Include related search queries")
 
 
 class GetTrendingByCategoryInput(BaseModel):
-    """Input for get_trending_by_category tool."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
 
     categories: List[str] = Field(
         default=["tech", "health", "entertainment"],
         description=(
-            "List of categories to filter by, matched against each trend's "
-            "keyword/related queries/news text (e.g. ['tech', 'health']). "
-            "Note: Google's trending RSS feed is not natively category-scoped, "
-            "so this performs keyword-based filtering over the general "
-            "trending feed rather than a true per-category query."
+            "List of categories to filter by. "
+            "Available: all, entertainment, beauty, business, cars, cooking, "
+            "crypto, fitness, games, health, hobbies, internet, jobs, movies, "
+            "music, news, pets, real_estate, science, shopping, sports, tech, travel."
         ),
         max_length=10,
     )
-    region: str = Field(default="US", description="Region code (US, UK, IN, etc.)")
-    limit: int = Field(default=5, description="Top N keywords per category", ge=1, le=20)
+    region: str = Field(default="US", description="Region code (US, IN, GB, etc.)")
+    limit: int = Field(default=10, description="Top N keywords per category", ge=1, le=30)
 
 
 class GetGeolocationHotspotsInput(BaseModel):
-    """Input for get_geolocation_hotspots tool."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
 
     keyword: str = Field(..., description="Keyword to geo-analyze", min_length=1, max_length=100)
@@ -294,7 +293,7 @@ class GetGeolocationHotspotsInput(BaseModel):
 @mcp.tool(
     name="detect_trending_keywords",
     annotations={
-        "title": "Detect Booming Search Keywords",
+        "title": "Detect Booming Search Keywords (Real-time)",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -303,17 +302,9 @@ class GetGeolocationHotspotsInput(BaseModel):
 )
 async def detect_trending_keywords(params: DetectTrendingKeywordsInput) -> str:
     """
-    Detect keywords currently booming on Google Search for a given region,
-    ranked by Google's own trending order, with real search volume and
-    freshness — built for SEO/content targeting (catch the spike early).
-
-    Args:
-        params: DetectTrendingKeywordsInput with region, limit, min_volume
-
-    Returns:
-        JSON with trending keywords: rank, keyword, search volume, how long
-        it's been trending, related queries (for keyword expansion), and
-        related news (for content angles).
+    Detect keywords currently booming on Google Search RIGHT NOW for a given
+    region, ranked by Google's own trending order with real search volume
+    and freshness. Data is always fetched live (~15-min RSS feed).
     """
     try:
         trends = await fetch_trending_rss(geo=params.region)
@@ -323,18 +314,18 @@ async def detect_trending_keywords(params: DetectTrendingKeywordsInput) -> str:
             volume = t.get("volume_min")
             if params.min_volume is not None and (volume is None or volume < params.min_volume):
                 continue
-            results.append(
-                {
-                    "rank": t.get("rank"),
-                    "keyword": t.get("keyword"),
-                    "search_volume": volume,
-                    "volume_text": t.get("volume_text"),
-                    "started_at": t.get("started_at"),
-                    "is_active": t.get("is_active"),
-                    "related_queries": t.get("related_queries", [])[:5],
-                    "news_titles": [n.get("title") for n in t.get("news", [])[:3] if n.get("title")],
-                }
-            )
+            results.append({
+                "rank": t.get("rank"),
+                "keyword": t.get("keyword"),
+                "search_volume": volume,
+                "volume_text": t.get("volume_text"),
+                "started_at": t.get("started_at"),
+                "is_active": t.get("is_active"),
+                "related_queries": t.get("related_queries", [])[:5],
+                "news_titles": [
+                    n.get("title") for n in t.get("news", [])[:3] if n.get("title")
+                ],
+            })
 
         results = results[: params.limit]
 
@@ -343,10 +334,12 @@ async def detect_trending_keywords(params: DetectTrendingKeywordsInput) -> str:
                 "trending_keywords": results,
                 "region": params.region,
                 "count": len(results),
-                "source": "google_trends_rss",
+                "source": "google_trends_rss_live",
+                "data_freshness": "~15 minutes",
                 "note": (
                     "search_volume is a floor estimate from Google's volume "
-                    "tier (e.g. '20000+'), not an exact count."
+                    "tier (e.g. '20000+'), not an exact count. "
+                    "Results reflect what is booming RIGHT NOW."
                 ),
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             },
@@ -378,15 +371,11 @@ async def get_keyword_interest_history(params: GetKeywordInterestHistoryInput) -
     Fetch detailed interest curve for a keyword over time via a real
     browser-rendered Explore call (trendspyg), with moving averages to
     detect trend direction and peaks.
-
-    Args:
-        params: GetKeywordInterestHistoryInput with keyword, timeframe, region, geo_breakdown
-
-    Returns:
-        JSON with interest curve, peak dates, trend direction, and optional geo breakdown
     """
     try:
-        env = await fetch_explore(params.keyword, geo=params.region, timeframe=params.timeframe)
+        env = await fetch_explore(
+            params.keyword, geo=params.region, timeframe=params.timeframe
+        )
         points = env.get("interest_over_time", [])
 
         if not points:
@@ -470,15 +459,6 @@ async def get_related_keywords(params: GetRelatedKeywordsInput) -> str:
     """
     Discover related keywords and search queries for context enrichment,
     via a real browser-rendered Explore call (trendspyg).
-
-    Returns related queries ranked by search interest (both "top" and
-    "rising" buckets, when Google provides both).
-
-    Args:
-        params: GetRelatedKeywordsInput with keyword, region, include_queries
-
-    Returns:
-        JSON with related queries
     """
     try:
         if not params.include_queries:
@@ -541,18 +521,6 @@ async def get_related_keywords(params: GetRelatedKeywordsInput) -> str:
 async def get_trending_by_category(params: GetTrendingByCategoryInput) -> str:
     """
     Filter currently-booming Google Search keywords by category-relevant terms.
-
-    Google's trending RSS feed is not natively category-scoped (that backend
-    was deprecated), so this fetches the general trending feed once and
-    keyword-matches each requested category against the trend's keyword,
-    related queries, and news headlines. Treat this as a best-effort filter,
-    not an exact per-category query.
-
-    Args:
-        params: GetTrendingByCategoryInput with categories, region, limit
-
-    Returns:
-        JSON with trending keywords grouped by category
     """
     try:
         trends = await fetch_trending_rss(geo=params.region)
@@ -568,15 +536,13 @@ async def get_trending_by_category(params: GetTrendingByCategoryInput) -> str:
                 haystack = " ".join(p for p in haystack_parts if p).lower()
 
                 if cat_lower in haystack:
-                    cat_results.append(
-                        {
-                            "rank": t.get("rank"),
-                            "keyword": t.get("keyword"),
-                            "search_volume": t.get("volume_min"),
-                            "volume_text": t.get("volume_text"),
-                            "started_at": t.get("started_at"),
-                        }
-                    )
+                    cat_results.append({
+                        "rank": t.get("rank"),
+                        "keyword": t.get("keyword"),
+                        "search_volume": t.get("volume_min"),
+                        "volume_text": t.get("volume_text"),
+                        "started_at": t.get("started_at"),
+                    })
 
             by_category[cat_name] = cat_results[: params.limit]
 
@@ -584,8 +550,9 @@ async def get_trending_by_category(params: GetTrendingByCategoryInput) -> str:
             {
                 "by_category": by_category,
                 "region": params.region,
-                "source": "google_trends_rss",
-                "note": "Best-effort keyword match over the general trending feed (no native category endpoint).",
+                "source": "google_trends_rss_live",
+                "data_freshness": "~15 minutes",
+                "note": "Best-effort keyword match over the live trending feed.",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             },
             indent=2,
@@ -613,18 +580,10 @@ async def get_trending_by_category(params: GetTrendingByCategoryInput) -> str:
 )
 async def get_geolocation_hotspots(params: GetGeolocationHotspotsInput) -> str:
     """
-    Identify which geographic regions a keyword is trending in, via a real
-    browser-rendered Explore call (trendspyg). Helps pinpoint geo-specific
-    explosions.
-
-    Args:
-        params: GetGeolocationHotspotsInput with keyword, limit
-
-    Returns:
-        JSON with top regions ranked by interest
+    Identify which geographic regions a keyword is trending in. Worldwide breakdown.
     """
     try:
-        env = await fetch_explore(params.keyword, geo="")  # worldwide breakdown
+        env = await fetch_explore(params.keyword, geo="")  # worldwide
         geo_points = env.get("interest_by_region", [])
 
         if not geo_points:
@@ -632,7 +591,9 @@ async def get_geolocation_hotspots(params: GetGeolocationHotspotsInput) -> str:
                 {"error": f"No geo data found for keyword: {params.keyword}"}, indent=2
             )
 
-        top_regions_sorted = sorted(geo_points, key=lambda r: r["value"], reverse=True)[: params.limit]
+        top_regions_sorted = sorted(
+            geo_points, key=lambda r: r["value"], reverse=True
+        )[: params.limit]
 
         top_regions = [
             {
@@ -667,7 +628,6 @@ async def get_geolocation_hotspots(params: GetGeolocationHotspotsInput) -> str:
 # ============================================================================
 
 def main():
-    """Initialize and run the MCP server."""
     _init_db()
     logger.info("Google Trends MCP server initialized (trendspyg backend)")
     mcp.run()
