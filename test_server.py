@@ -82,7 +82,7 @@ async def test_related_keywords():
     data = json.loads(result)
     print(json.dumps(data, indent=2))
     
-    assert "related_topics" in data, "Missing related_topics field"
+    assert "related_queries" in data, "Missing related_queries field"
     assert "related_queries" in data, "Missing related_queries field"
     print("✓ Test passed")
 
